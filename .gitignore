@@ -1,0 +1,20 @@
+# Printer credentials — never commit
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+venv_farm/
+.env
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Farm state persistence
+.farm_states/
+
+# OS
+.DS_Store
