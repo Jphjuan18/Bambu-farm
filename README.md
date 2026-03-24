@@ -19,7 +19,7 @@ A Streamlit-based management tool for Bambu Lab 3D printer farms.
    ./start.sh
    ```
 
-This will automatically install dependencies (`streamlit`, `bambulabs-api`) and launch the app.
+This will automatically create a virtual environment, install dependencies (`streamlit`, `bambulabs-api`), and launch the app.
 
 ## Troubleshooting
 
@@ -27,6 +27,8 @@ This will automatically install dependencies (`streamlit`, `bambulabs-api`) and 
 - **`streamlit: command not found`** — Try running `python3 -m streamlit run app.py` instead
 - **Windows** — `.sh` scripts don't run natively; use WSL, Git Bash, or run the commands manually:
   ```bash
+  python3 -m venv venv
+  source venv/bin/activate
   pip install -r requirements.txt
   streamlit run app.py
   ```
