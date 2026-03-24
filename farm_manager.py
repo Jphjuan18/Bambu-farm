@@ -2,19 +2,27 @@
 Farm manager — runs the print cycle in a background thread.
 
 Cycle for each print job:
-  1. Pre-sweep  : send clearing G-code (ensures plate is empty before printing)
+  1. Before-print G-code : e.g. sweep to ensure plate is empty
   2. Upload + start print
   3. Monitor until FINISH / FAILED
-  4. Post-sweep : send clearing G-code (cools 45 min, then pushes print off plate)
+  4. After-print G-code  : e.g. wait for cooldown, dwell, then sweep
   5. Repeat for next job in queue
+
+Supports multiple concurrent instances (one per printer).
+Persists queue to disk so an app restart can resume.
+Automatically reconnects MQTT if the connection drops.
+Halts the farm if after-print G-code fails (sweep safety).
 """
 
+import base64
 import io
+import json
 import re
 import time
 import threading
 import traceback
 import zipfile
+from pathlib import Path
 from typing import Optional
 
 import bambulabs_api as bl
@@ -24,6 +32,8 @@ import bambulabs_api as bl
 _IDLE_STATES = ("IDLE", "FINISH", "FAILED", "PAUSE")
 # States that mean a print has ended (success or failure)
 _DONE_STATES  = ("FINISH", "FAILED", "ERROR", "IDLE")
+
+STATE_DIR = Path(".farm_states")
 
 
 def _parse_state(raw) -> str:
@@ -64,28 +74,35 @@ def _gcode_lines(gcode_text: str) -> list[str]:
 
 
 class FarmManager:
-    def __init__(self):
+    def __init__(self, printer_id: int = 0):
+        self.printer_id = printer_id
         self.running: bool = False
+        self.paused: bool = False
+        self.pause_reason: str = ""
         self.current_step: str = ""
         self.log: list[str] = []
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._state_file = STATE_DIR / f"farm_state_{printer_id}.json"
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def start(self, printer: bl.Printer, queue: list[dict], clearing_gcode: str):
+    def start(self, printer: bl.Printer, queue: list[dict],
+              before_print_gcode: str, after_print_gcode: str):
         """Hand off the queue to the background thread and start the farm cycle."""
         if self.running:
             return
         with self._lock:
             self.running = True
+            self.paused = False
+            self.pause_reason = ""
             self.log = []
             self.current_step = "Starting…"
         self._thread = threading.Thread(
             target=self._run_farm,
-            args=(printer, list(queue), clearing_gcode),
+            args=(printer, list(queue), before_print_gcode, after_print_gcode),
             daemon=True,
-            name="BambuFarm",
+            name=f"BambuFarm-{self.printer_id}",
         )
         self._thread.start()
 
@@ -93,6 +110,76 @@ class FarmManager:
         """Signal the farm thread to stop after the current operation."""
         self.running = False
         self.current_step = "Stopping…"
+
+    # ── State persistence ──────────────────────────────────────────────────────
+
+    def _save_state(self, queue: list[dict], job_num: int, total: int,
+                    before_gcode: str, after_gcode: str):
+        """Persist remaining queue to disk so the app can resume after restart."""
+        STATE_DIR.mkdir(exist_ok=True)
+        serializable = []
+        for job in queue:
+            serializable.append({
+                "filename": job["filename"],
+                "plate": job["plate"],
+                "bytes_b64": base64.b64encode(job["bytes"]).decode("ascii"),
+            })
+        state = {
+            "queue": serializable,
+            "job_num": job_num,
+            "total": total,
+            "before_gcode": before_gcode,
+            "after_gcode": after_gcode,
+        }
+        self._state_file.write_text(json.dumps(state))
+
+    def _clear_state(self):
+        if self._state_file.exists():
+            self._state_file.unlink()
+
+    def load_saved_state(self) -> Optional[dict]:
+        """Load persisted state, if any. Returns None if no saved state."""
+        if not self._state_file.exists():
+            return None
+        try:
+            raw = json.loads(self._state_file.read_text())
+            for job in raw.get("queue", []):
+                job["bytes"] = base64.b64decode(job.pop("bytes_b64"))
+            return raw
+        except Exception:
+            return None
+
+    # ── MQTT reconnection ──────────────────────────────────────────────────────
+
+    def _ensure_connected(self, printer: bl.Printer, max_retries: int = 3) -> bool:
+        """Check MQTT connection; reconnect if dropped. Returns True if connected."""
+        try:
+            if printer.mqtt_client_connected():
+                return True
+        except Exception:
+            pass
+
+        self._log("MQTT connection lost — attempting reconnect…")
+        for attempt in range(1, max_retries + 1):
+            if not self.running:
+                return False
+            try:
+                printer.mqtt_stop()
+            except Exception:
+                pass
+            try:
+                printer.mqtt_start()
+                for _ in range(6):
+                    time.sleep(1)
+                    if printer.mqtt_client_connected():
+                        self._log(f"Reconnected on attempt {attempt}.")
+                        return True
+            except Exception as exc:
+                self._log(f"Reconnect attempt {attempt} failed: {exc}")
+            time.sleep(5 * attempt)  # backoff
+
+        self._log("ERROR: Could not reconnect after retries.")
+        return False
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -113,6 +200,7 @@ class FarmManager:
         for cmd in commands:
             if not self.running:
                 return False
+            self._ensure_connected(printer)
             try:
                 printer.gcode(cmd, gcode_check=False)
                 time.sleep(0.1)
@@ -131,6 +219,7 @@ class FarmManager:
         while time.time() < deadline:
             if not self.running:
                 return False
+            self._ensure_connected(printer)
             try:
                 state = _parse_state(printer.get_state())
                 if state != last_state:
@@ -155,6 +244,7 @@ class FarmManager:
         while time.time() < deadline:
             if not self.running:
                 return False
+            self._ensure_connected(printer)
             try:
                 state = _parse_state(printer.get_state())
                 self._log(f"  poll: state={state}")
@@ -171,6 +261,7 @@ class FarmManager:
         """Poll until the active print finishes. Returns the final state string."""
         last_pct: Optional[int] = None
         while self.running:
+            self._ensure_connected(printer)
             try:
                 state = _parse_state(printer.get_state())
                 pct   = printer.get_percentage()
@@ -184,35 +275,56 @@ class FarmManager:
             time.sleep(30)
         return "STOPPED"
 
-    def _clearing_sequence(self, printer: bl.Printer, gcode_text: str, label: str):
-        """Send clearing G-code and wait for the printer to go idle."""
+    def _clearing_sequence(self, printer: bl.Printer, gcode_text: str, label: str) -> bool:
+        """Send clearing G-code and wait for idle. Returns True on success."""
         self._log(f"── {label} ──")
         self.current_step = label
         sent = self._send_gcode(printer, gcode_text)
         if not sent:
             self._log("Skipping wait — no G-code was sent.")
-            return
+            return False
         # Small pause so the printer registers the new commands before we poll
         time.sleep(5)
-        self._wait_for_idle(printer, timeout=7200)  # 2-hour ceiling
+        idle_reached = self._wait_for_idle(printer, timeout=7200)  # 2-hour ceiling
+        if not idle_reached:
+            self._log(f"WARNING: {label} did not complete (idle not reached).")
+            return False
         self._log(f"{label} complete.")
+        return True
 
     # ── Main farm loop ─────────────────────────────────────────────────────────
 
-    def _run_farm(self, printer: bl.Printer, queue: list[dict], clearing_gcode: str):
+    def _run_farm(self, printer: bl.Printer, queue: list[dict],
+                  before_print_gcode: str, after_print_gcode: str):
         total = len(queue)
         try:
             self._log(f"Farm started — {total} job(s) queued.")
 
-            # ── Pre-sweep: make sure the plate is empty before job 1 ──────────
+            # ── Before-print G-code: make sure the plate is empty before job 1 ─
             if not self.running:
                 return
-            self._clearing_sequence(printer, clearing_gcode, "Pre-sweep (ensuring clean plate)")
+            if before_print_gcode.strip():
+                success = self._clearing_sequence(
+                    printer, before_print_gcode,
+                    "Before-print (ensuring clean plate)")
+                if not success and self.running:
+                    self.paused = True
+                    self.pause_reason = (
+                        "Before-print G-code failed before first job. "
+                        "Check printer and resume manually."
+                    )
+                    self._log(f"PAUSED: {self.pause_reason}")
+                    self._save_state(queue, 0, total, before_print_gcode, after_print_gcode)
+                    self.running = False
+                    return
 
             job_num = 0
             while queue and self.running:
                 job_num += 1
                 job      = queue.pop(0)
+                # Save remaining queue to disk after popping
+                self._save_state(queue, job_num, total, before_print_gcode, after_print_gcode)
+
                 filename = _safe_filename(job["filename"])
                 plate    = job.get("plate", 1)
                 data     = job["bytes"]
@@ -223,6 +335,17 @@ class FarmManager:
                     f" — {remaining} job(s) remaining after this"
                 )
                 self.current_step = f"Uploading: {filename}"
+
+                # ── Ensure MQTT is alive before upload ────────────────────────
+                if not self._ensure_connected(printer):
+                    self._log("ERROR: Cannot reach printer — pausing farm.")
+                    # Put the job back
+                    queue.insert(0, job)
+                    self.paused = True
+                    self.pause_reason = "Lost connection to printer and could not reconnect."
+                    self._save_state(queue, job_num - 1, total, before_print_gcode, after_print_gcode)
+                    self.running = False
+                    break
 
                 # ── Validate 3mf contents ────────────────────────────────────
                 if filename.endswith(".3mf"):
@@ -292,16 +415,44 @@ class FarmManager:
                 if not self.running:
                     break
 
-                # ── Post-sweep: cool + push completed print off plate ─────────
-                self._clearing_sequence(
-                    printer, clearing_gcode,
-                    f"Post-sweep (clearing print {job_num}/{total})"
-                )
+                # ── After-print G-code: cool + push completed print off plate ──
+                if after_print_gcode.strip():
+                    success = self._clearing_sequence(
+                        printer, after_print_gcode,
+                        f"After-print (clearing print {job_num}/{total})"
+                    )
+                    if not success and self.running:
+                        self.paused = True
+                        self.pause_reason = (
+                            f"After-print G-code failed on job {job_num}/{total}. "
+                            "Farm paused to prevent collision. Check printer and resume."
+                        )
+                        self._log(f"PAUSED: {self.pause_reason}")
+                        self._save_state(queue, job_num, total, before_print_gcode, after_print_gcode)
+                        self.running = False
+                        break
+
+                # ── Before-print G-code for next job ─────────────────────────
+                if queue and self.running and before_print_gcode.strip():
+                    success = self._clearing_sequence(
+                        printer, before_print_gcode,
+                        f"Before-print (preparing for next job)"
+                    )
+                    if not success and self.running:
+                        self.paused = True
+                        self.pause_reason = (
+                            f"Before-print G-code failed after job {job_num}/{total}. "
+                            "Farm paused. Check printer and resume."
+                        )
+                        self._log(f"PAUSED: {self.pause_reason}")
+                        self._save_state(queue, job_num, total, before_print_gcode, after_print_gcode)
+                        self.running = False
+                        break
 
             # ── Done ──────────────────────────────────────────────────────────
             if self.running:
                 self._log(f"All {job_num} job(s) complete! Farm finished.")
-            else:
+            elif not self.paused:
                 self._log("Farm stopped by user.")
 
         except Exception as exc:
@@ -310,3 +461,6 @@ class FarmManager:
         finally:
             self.running = False
             self.current_step = ""
+            # Only clear state file if all jobs completed successfully
+            if not queue and not self.paused:
+                self._clear_state()

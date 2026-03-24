@@ -12,5 +12,8 @@ venv/
 # Streamlit
 .streamlit/secrets.toml
 
+# Farm state persistence
+.farm_states/
+
 # OS
 .DS_Store
