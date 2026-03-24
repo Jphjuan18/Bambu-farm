@@ -88,7 +88,8 @@ class FarmManager:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def start(self, printer: bl.Printer, queue: list[dict],
-              before_print_gcode: str, after_print_gcode: str):
+              before_print_gcode: str, after_print_gcode: str,
+              is_resume: bool = False):
         """Hand off the queue to the background thread and start the farm cycle."""
         if self.running:
             return
@@ -100,7 +101,7 @@ class FarmManager:
             self.current_step = "Starting…"
         self._thread = threading.Thread(
             target=self._run_farm,
-            args=(printer, list(queue), before_print_gcode, after_print_gcode),
+            args=(printer, list(queue), before_print_gcode, after_print_gcode, is_resume),
             daemon=True,
             name=f"BambuFarm-{self.printer_id}",
         )
@@ -295,15 +296,47 @@ class FarmManager:
     # ── Main farm loop ─────────────────────────────────────────────────────────
 
     def _run_farm(self, printer: bl.Printer, queue: list[dict],
-                  before_print_gcode: str, after_print_gcode: str):
+                  before_print_gcode: str, after_print_gcode: str,
+                  is_resume: bool = False):
+        _ACTIVE_STATES = ("RUNNING", "PREPARE", "SLICING", "PRINTING")
         total = len(queue)
         try:
-            self._log(f"Farm started — {total} job(s) queued.")
+            if is_resume:
+                self._log(f"Farm resumed — {total} job(s) remaining.")
+                # If the printer is actively printing, wait for it to finish
+                # before doing anything — don't send G-code mid-print!
+                try:
+                    state = _parse_state(printer.get_state())
+                    if any(s in state for s in _ACTIVE_STATES):
+                        self._log(f"Printer is {state} — waiting for current print to finish…")
+                        self.current_step = "Waiting for active print to finish"
+                        final_state = self._wait_for_print_complete(printer)
+                        self._log(f"Active print ended with state: {final_state}")
+                        # Run after-print G-code for the print that just finished
+                        if after_print_gcode.strip() and "FINISH" in final_state:
+                            success = self._clearing_sequence(
+                                printer, after_print_gcode,
+                                "After-print (clearing finished print)")
+                            if not success and self.running:
+                                self.paused = True
+                                self.pause_reason = (
+                                    "After-print G-code failed on resumed print. "
+                                    "Check printer and resume manually."
+                                )
+                                self._log(f"PAUSED: {self.pause_reason}")
+                                self._save_state(queue, 0, total, before_print_gcode, after_print_gcode)
+                                self.running = False
+                                return
+                except Exception as exc:
+                    self._log(f"WARNING: Could not check printer state on resume: {exc}")
+            else:
+                self._log(f"Farm started — {total} job(s) queued.")
 
             # ── Before-print G-code: make sure the plate is empty before job 1 ─
+            # Skip on resume — the printer may be mid-print or plate already has a part
             if not self.running:
                 return
-            if before_print_gcode.strip():
+            if before_print_gcode.strip() and not is_resume:
                 success = self._clearing_sequence(
                     printer, before_print_gcode,
                     "Before-print (ensuring clean plate)")

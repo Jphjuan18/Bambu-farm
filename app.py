@@ -248,7 +248,8 @@ def page_farm_mode():
             with c_resume:
                 if st.button("Resume Farm", key=f"resume_{pid}", type="primary"):
                     farm.start(selected_p, saved["queue"],
-                               saved["before_gcode"], saved["after_gcode"])
+                               saved["before_gcode"], saved["after_gcode"],
+                               is_resume=True)
                     st.rerun()
             with c_discard:
                 if st.button("Discard saved state", key=f"discard_{pid}"):
